@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/getsentry/raven-go"
 	"github.com/iotaledger/giota"
@@ -45,51 +46,71 @@ func main() {
 		fmt.Printf("\nListening on http://localhost:%v\n", port)
 
 		// Start listening
-		http.ListenAndServe(":"+port, nil)
+		log.Fatal(http.ListenAndServe(":"+port, nil))
 
 	}, nil)
 }
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Print("\nProcessing trytes\n")
-	if r.Method == "POST" {
-
-		// Unmarshal JSON
-		b, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Invalid request method", http.StatusBadRequest)
-			return
-		}
-		defer r.Body.Close()
-		req := indexRequest{}
-		json.Unmarshal(b, &req)
-
-		// Convert []Trytes to []Transaction
-		txs := make([]giota.Transaction, len(req.Trytes))
-		for i, t := range req.Trytes {
-			tx, _ := giota.NewTransaction(t)
-			txs[i] = *tx
-		}
-
-		// Get configuration.
-		provider := os.Getenv("PROVIDER")
-		minDepth, _ := strconv.ParseInt(os.Getenv("MIN_DEPTH"), 10, 64)
-		minWeightMag, _ := strconv.ParseInt(os.Getenv("MIN_WEIGHT_MAGNITUDE"), 10, 64)
-
-		// Async sendTrytes
-		api := giota.NewAPI(provider, nil)
-		_, pow := giota.GetBestPoW()
-
-		fmt.Print("Sending Transactions...\n")
-		go func() {
-			e := giota.SendTrytes(api, minDepth, txs, minWeightMag, pow)
-			raven.CaptureError(e, nil)
-		}()
-
-		w.WriteHeader(http.StatusNoContent)
-	} else {
+	// POST only
+	if r.Method != "POST" {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
 	}
+
+	// Unmarshal JSON
+	b, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Invalid request method", http.StatusBadRequest)
+		return
+	}
+
+	defer r.Body.Close()
+
+	req := indexRequest{}
+	err = json.Unmarshal(b, &req)
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
+	// Convert []Trytes to []Transaction
+	txs := make([]giota.Transaction, len(req.Trytes))
+	for i, t := range req.Trytes {
+		tx, _ := giota.NewTransaction(t)
+		txs[i] = *tx
+	}
+
+	// Get configuration.
+	provider := os.Getenv("PROVIDER")
+	minDepth, _ := strconv.ParseInt(os.Getenv("MIN_DEPTH"), 10, 64)
+	minWeightMag, _ := strconv.ParseInt(os.Getenv("MIN_WEIGHT_MAGNITUDE"), 10, 64)
+
+	// Async sendTrytes
+	api := giota.NewAPI(provider, nil)
+	powname, pow := giota.GetBestPoW()
+	fmt.Printf("Starting proof of work: %q\n", powname)
+
+	c := make(chan struct{})
+
+	go func(ch chan struct{}) {
+		e := giota.SendTrytes(api, minDepth, txs, minWeightMag, pow)
+		if e != nil {
+			log.Println("error sending trytes:", e)
+			raven.CaptureError(e, nil)
+		}
+		ch <- struct{}{}
+	}(c)
+
+	select {
+	case <-time.After(time.Second * 10):
+		log.Println("Timeout reached: 10 sec")
+	case <-c:
+		log.Println("Sent tx!")
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func powHandler(w http.ResponseWriter, r *http.Request) {
@@ -99,6 +120,7 @@ func powHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		http.Error(w, err.Error(), 500)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
